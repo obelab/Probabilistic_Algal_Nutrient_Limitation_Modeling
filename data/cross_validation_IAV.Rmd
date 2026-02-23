@@ -1,0 +1,589 @@
+---
+title: "Cross validation results"
+date: "1 Dec 2025"
+author: "Brian Baird and Smitom Borah"
+output: html_notebook
+---
+
+# Description
+This notebook contains code used to cross validate the IAV model. First, cleaned NLA data is loaded. Then the dataset is broken into 4 different folds, each with a portion assigned to calibration and a portion assigned to validation. Finally, the results of the seperate folds are combined and visualized. 
+
+# Packages
+```{r echo=TRUE}
+# List of required packages
+packages <- c("nimble", "coda", "ggplot2", "tidyverse", "ggside", "psych")
+
+# Install any that are not already installed
+install_if_missing <- function(p) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    install.packages(p)
+  }
+}
+
+invisible(lapply(packages, install_if_missing))
+
+# Load all packages
+lapply(packages, library, character.only = TRUE)
+```
+
+
+# Data
+Let us load the data to run the model. The data has been post-processed from the data sources described in the associated research article.
+```{r}
+# load data
+bnla_final <- read.csv("data/bnla_final.csv")
+
+# Add observed TN:TP to dataset
+bnla_final <- mutate(bnla_final, tn_tp = tn / tp)
+lake_mean_n_p <- bnla_final %>%
+  group_by(specific_lake_bin) %>%
+  summarize(mean_lake_tn_tp = mean(tn_tp)) %>%
+  ungroup()
+```
+
+### Assign cross validation folds -----------------------------------------------------------------------------------------------------------
+```{r assign cross validation folds}
+xv_time_val_1 <- bnla_final[grep("NLA22", bnla_final$SITE_ID),]                         ### Assign four different folds
+xv_time_val_2 <- bnla_final[grep("NLA17", bnla_final$SITE_ID),]                         ### using NLA year to divide
+xv_time_val_3 <- bnla_final[grep("NLA12", bnla_final$SITE_ID),]                         ### the data
+xv_time_val_4 <- bnla_final[grep("NLA06", bnla_final$SITE_ID),]
+xv_time_cal_1 <- bnla_final[-grep("NLA22", bnla_final$SITE_ID),] %>%
+  mutate(specific_lake_bin_xv = as.numeric(as.factor(specific_lake_bin)))
+xv_time_cal_2 <- bnla_final[-grep("NLA17", bnla_final$SITE_ID),] %>%
+  mutate(specific_lake_bin_xv = as.numeric(as.factor(specific_lake_bin)))
+xv_time_cal_3 <- bnla_final[-grep("NLA12", bnla_final$SITE_ID),] %>%
+  mutate(specific_lake_bin_xv = as.numeric(as.factor(specific_lake_bin)))
+xv_time_cal_4 <- bnla_final[-grep("NLA06", bnla_final$SITE_ID),] %>%
+  mutate(specific_lake_bin_xv = as.numeric(as.factor(specific_lake_bin)))
+```
+
+### Cross Validation ----------------------------------------
+Fold 1
+```{r Fold 1}
+### Model Formulation
+code <- nimbleCode({
+  b.0 ~ dnorm(0, sd = 10)
+  b.tp ~ dnorm(0, sd = 10)
+  b.cr ~dnorm(20, sd = 5)
+  sigma ~ dunif(0, 10)
+  s.reint ~ dunif(0, 10)
+  s.rebR ~ dunif(0,10)
+  s.reln ~ dunif(0,10)
+  s.lake ~ dunif(0,10)
+  
+  for(i in 1:n) {
+    x.ln[i] <- min(x.tp[i],x.tn[i]/(beta_bR[s.j[i]]))
+    y[i] ~ dnorm(beta_ln[s.j[i]]*log(x.ln[i]) + beta_int[s.j[i]] + relake[s.k[i]], sd = sigma) 
+  }
+  for(j in 1:m) {
+    beta_bR[j] <- b.cr + rebR[j]
+    beta_int[j] <- b.0 + reint[j]
+    beta_ln[j] <- b.tp + reln[j]
+    reint[j] ~ dnorm(0, sd = s.reint)
+    rebR[j] ~ dnorm(0, sd = s.rebR)
+    reln[j] ~ dnorm(0, sd = s.reln)
+  }
+  for (k in 1:p) {
+    relake[k] ~ dnorm(0, sd = s.lake)
+  }
+})
+
+### Dimension Assignment
+n=length(xv_time_cal_1$chl); n
+m=length(unique(xv_time_cal_1$temp_bin)); m
+p=length(unique(xv_time_cal_1$specific_lake_bin)); p
+
+### Prepare data for Nimble model
+constants <- list(n = n, 
+                  m = m, 
+                  x.tp = xv_time_cal_1$tp,
+                  x.tn = xv_time_cal_1$tn,
+                  s.j = xv_time_cal_1$temp_bin,
+                  s.k = xv_time_cal_1$specific_lake_bin_xv)
+yt = log(xv_time_cal_1$chl) # Observed ln(chl) values
+data <- list(y = yt)
+inits <- list(b.0 = 1, b.tp = 1, b.cr = 15, sigma = 1, s.reint = 1, s.rebR = 1, s.reln = 1, s.lake = 1, relake=rep(0,p), reint=rep(0,m), rebR=rep(0,m), reln=rep(0,m))
+
+### Build/Run Model and Obtain Samples
+Nmodel <- nimbleModel(code, constants = constants, data = data, inits = inits) 
+NmodelMCMC <- buildMCMC(Nmodel, monitors2 = c("beta_bR", "beta_int", "beta_ln", "relake"), enableWAIC = TRUE) # REMEMBER TO SET MONITORS
+cNmodel <- compileNimble(Nmodel)
+cNmodelMCMC <- compileNimble(NmodelMCMC, project=Nmodel)
+n.iter = 50000 # REMEMBER TO SET DESIRED NUMBER OF ITERATIONS
+samples <- runMCMC(cNmodelMCMC, niter = n.iter, WAIC = TRUE, nchains = 3, samplesAsCodaMCMC = TRUE, nburnin = 10000) 
+
+
+
+### Summary of Output
+summary(samples$samples) 
+summary(samples$samples2[,1:15]) 
+
+
+### Rhat Calculations
+gelman.diag(samples$samples) 
+gelman.diag(samples$samples2[,1:15]) 
+
+### Make sample statistics a df mean values can be called directly
+samp1 <- data.frame(summary(samples$samples)$statistics)
+samp2 <- data.frame(summary(samples$samples2[,1:15])$statistics)
+
+### Combines all three chains into one chain in order to assess significance (B5 - B1)
+chains1 <- bind_rows(data.frame(samples$samples$chain1),         
+                 bind_rows(data.frame(samples$samples$chain2),
+                           data.frame(samples$samples$chain3)))
+
+chains2 <- bind_rows(data.frame(samples$samples2$chain1[,1:15]),
+                 bind_rows(data.frame(samples$samples2$chain2[,1:15]),
+                           data.frame(samples$samples2$chain3[,1:15])))
+
+
+### Store lists of parameter coefficients
+beta_bR_means <- samp2$Mean[1:5]
+beta_int_means <- samp2$Mean[6:10]
+beta_tp_means <- samp2$Mean[11:15]
+
+
+### Check significance of bin variation parameters
+beta_bR_delta <- chains2[,5] - chains2[,1]                                                    
+beta_bR_sig <- length(beta_bR_delta[beta_bR_delta > 0]) / length(beta_bR_delta); beta_bR_sig
+
+beta_int_delta <- chains2[,10] - chains2[,6]
+beta_int_sig <- length(beta_int_delta[beta_int_delta > 0]) / length(beta_int_delta); beta_int_sig
+
+beta_tp_delta <- chains2[,15] - chains2[,11]
+beta_tp_sig <- length(beta_tp_delta[beta_tp_delta > 0]) / length(beta_tp_delta); beta_tp_sig
+
+### Calculate Predictions
+x.ln = pmin(constants$x.tp,  constants$x.tn/(beta_bR_means[constants$s.j])) #limiting nutrient (units of tp)
+sum(x.ln==constants$x.tp)/length(x.ln) #fraction of time p is limiting
+y.hat = beta_int_means[constants$s.j] + log(x.ln)*(beta_tp_means[constants$s.j]) 
+
+
+# Calculate R2 and RMSE
+y.er=yt-y.hat
+R2=1-sum(y.er^2)/sum((yt-mean(yt))^2); R2 
+rmse <- sqrt(mean(y.er^2)); rmse
+
+# Validation Predictions --------------------------------------------------------------------------
+### Calculate Predictions
+x.ln = pmin(xv_time_val_1$tp,  xv_time_val_1$tn/(beta_bR_means[xv_time_val_1$temp_bin])) #limiting nutrient (units of tp)
+sum(x.ln==xv_time_val_1$tp)/length(x.ln) #fraction of time p is limiting
+y.hat1 = beta_int_means[xv_time_val_1$temp_bin] + log(x.ln)*(beta_tp_means[xv_time_val_1$temp_bin]) 
+
+### Redefine yt
+yt1 = log(xv_time_val_1$chl)
+
+# Calculate R2 and RMSE
+y.er1=yt1-y.hat1
+R2=1-sum(y.er1^2)/sum((yt1-mean(yt1))^2); R2 
+rmse <- sqrt(mean(y.er1^2)); rmse
+```
+
+
+Fold 2
+```{r Fold 2}
+### Model Formulation
+code <- nimbleCode({
+  b.0 ~ dnorm(0, sd = 10)
+  b.tp ~ dnorm(0, sd = 10)
+  b.cr ~dnorm(20, sd = 5)
+  sigma ~ dunif(0, 10)
+  s.reint ~ dunif(0, 10)
+  s.rebR ~ dunif(0,10)
+  s.reln ~ dunif(0,10)
+  s.lake ~ dunif(0,10)
+  
+  for(i in 1:n) {
+    x.ln[i] <- min(x.tp[i],x.tn[i]/(beta_bR[s.j[i]]))
+    y[i] ~ dnorm(beta_ln[s.j[i]]*log(x.ln[i]) + beta_int[s.j[i]] + relake[s.k[i]], sd = sigma) 
+  }
+  for(j in 1:m) {
+    beta_bR[j] <- b.cr + rebR[j]
+    beta_int[j] <- b.0 + reint[j]
+    beta_ln[j] <- b.tp + reln[j]
+    reint[j] ~ dnorm(0, sd = s.reint)
+    rebR[j] ~ dnorm(0, sd = s.rebR)
+    reln[j] ~ dnorm(0, sd = s.reln)
+  }
+  for (k in 1:p) {
+    relake[k] ~ dnorm(0, sd = s.lake)
+  }
+})
+
+### Dimension Assignment
+n=length(xv_time_cal_2$chl); n
+m=length(unique(xv_time_cal_2$temp_bin)); m
+p=length(unique(xv_time_cal_2$specific_lake_bin)); p
+
+### Prepare data for Nimble model
+constants <- list(n = n, 
+                  m = m, 
+                  x.tp = xv_time_cal_2$tp,
+                  x.tn = xv_time_cal_2$tn,
+                  s.j = xv_time_cal_2$temp_bin,
+                  s.k = xv_time_cal_2$specific_lake_bin_xv)
+yt = log(xv_time_cal_2$chl) # Observed ln(chl) values
+data <- list(y = yt)
+inits <- list(b.0 = 1, b.tp = 1, b.cr = 15, sigma = 1, s.reint = 1, s.rebR = 1, s.reln = 1, s.lake = 1, relake=rep(0,p), reint=rep(0,m), rebR=rep(0,m), reln=rep(0,m))
+
+### Build/Run Model and Obtain Samples
+Nmodel <- nimbleModel(code, constants = constants, data = data, inits = inits) 
+NmodelMCMC <- buildMCMC(Nmodel, monitors2 = c("beta_bR", "beta_int", "beta_ln", "relake"), enableWAIC = TRUE) # REMEMBER TO SET MONITORS
+cNmodel <- compileNimble(Nmodel)
+cNmodelMCMC <- compileNimble(NmodelMCMC, project=Nmodel)
+n.iter = 50000 # REMEMBER TO SET DESIRED NUMBER OF ITERATIONS
+samples <- runMCMC(cNmodelMCMC, niter = n.iter, WAIC = TRUE, nchains = 3, samplesAsCodaMCMC = TRUE, nburnin = 10000) 
+
+
+
+### Summary of Output
+summary(samples$samples) 
+summary(samples$samples2[,1:15]) 
+
+### Rhat Calculations
+gelman.diag(samples$samples) 
+gelman.diag(samples$samples2[,1:15]) 
+
+
+### Make sample statistics a df mean values can be called directly
+samp1 <- data.frame(summary(samples$samples)$statistics)
+samp2 <- data.frame(summary(samples$samples2[,1:15])$statistics)
+
+### Combines all three chains into one chain in order to assess significance (B5 - B1)
+chains1 <- bind_rows(data.frame(samples$samples$chain1),         
+                 bind_rows(data.frame(samples$samples$chain2),
+                           data.frame(samples$samples$chain3)))
+
+chains2 <- bind_rows(data.frame(samples$samples2$chain1[,1:15]),
+                 bind_rows(data.frame(samples$samples2$chain2[,1:15]),
+                           data.frame(samples$samples2$chain3[,1:15])))
+
+
+### Store lists of parameter coefficients
+beta_bR_means <- samp2$Mean[1:5]
+beta_int_means <- samp2$Mean[6:10]
+beta_tp_means <- samp2$Mean[11:15]
+
+
+### Check significance of bin variation parameters
+beta_bR_delta <- chains2[,5] - chains2[,1]                                                    
+beta_bR_sig <- length(beta_bR_delta[beta_bR_delta > 0]) / length(beta_bR_delta); beta_bR_sig
+
+beta_int_delta <- chains2[,10] - chains2[,6]
+beta_int_sig <- length(beta_int_delta[beta_int_delta > 0]) / length(beta_int_delta); beta_int_sig
+
+beta_tp_delta <- chains2[,15] - chains2[,11]
+beta_tp_sig <- length(beta_tp_delta[beta_tp_delta > 0]) / length(beta_tp_delta); beta_tp_sig
+
+### Calculate Predictions
+x.ln = pmin(constants$x.tp,  constants$x.tn/(beta_bR_means[constants$s.j])) #limiting nutrient (units of tp)
+sum(x.ln==constants$x.tp)/length(x.ln) #fraction of time p is limiting
+y.hat = beta_int_means[constants$s.j] + log(x.ln)*(beta_tp_means[constants$s.j]) 
+
+# Calculate R2 and RMSE
+y.er=yt-y.hat
+R2=1-sum(y.er^2)/sum((yt-mean(yt))^2); R2 
+rmse <- sqrt(mean(y.er^2)); rmse
+
+# Validation Predictions --------------------------------------------------------------------------
+### Calculate Predictions
+x.ln = pmin(xv_time_val_2$tp,  xv_time_val_2$tn/(beta_bR_means[xv_time_val_2$temp_bin])) #limiting nutrient (units of tp)
+sum(x.ln==xv_time_val_2$tp)/length(x.ln) #fraction of time p is limiting
+y.hat2 = beta_int_means[xv_time_val_2$temp_bin] + log(x.ln)*(beta_tp_means[xv_time_val_2$temp_bin]) 
+
+### Redefine yt
+yt2 = log(xv_time_val_2$chl)
+
+# Calculate R2 and RMSE
+y.er2=yt2-y.hat2
+R2=1-sum(y.er2^2)/sum((yt2-mean(yt2))^2); R2 
+rmse <- sqrt(mean(y.er2^2)); rmse
+```
+
+
+Fold 3
+```{r Fold 3}
+### Model Formulation
+code <- nimbleCode({
+  b.0 ~ dnorm(0, sd = 10)
+  b.tp ~ dnorm(0, sd = 10)
+  b.cr ~dnorm(20, sd = 5)
+  sigma ~ dunif(0, 10)
+  s.reint ~ dunif(0, 10)
+  s.rebR ~ dunif(0,10)
+  s.reln ~ dunif(0,10)
+  s.lake ~ dunif(0,10)
+  
+  for(i in 1:n) {
+    x.ln[i] <- min(x.tp[i],x.tn[i]/(beta_bR[s.j[i]]))
+    y[i] ~ dnorm(beta_ln[s.j[i]]*log(x.ln[i]) + beta_int[s.j[i]] + relake[s.k[i]], sd = sigma) 
+  }
+  for(j in 1:m) {
+    beta_bR[j] <- b.cr + rebR[j]
+    beta_int[j] <- b.0 + reint[j]
+    beta_ln[j] <- b.tp + reln[j]
+    reint[j] ~ dnorm(0, sd = s.reint)
+    rebR[j] ~ dnorm(0, sd = s.rebR)
+    reln[j] ~ dnorm(0, sd = s.reln)
+  }
+  for (k in 1:p) {
+    relake[k] ~ dnorm(0, sd = s.lake)
+  }
+})
+
+### Dimension Assignment
+n=length(xv_time_cal_3$chl); n
+m=length(unique(xv_time_cal_3$temp_bin)); m
+p=length(unique(xv_time_cal_3$specific_lake_bin)); p
+
+### Prepare data for Nimble model
+constants <- list(n = n, 
+                  m = m, 
+                  x.tp = xv_time_cal_3$tp,
+                  x.tn = xv_time_cal_3$tn,
+                  s.j = xv_time_cal_3$temp_bin,
+                  s.k = xv_time_cal_3$specific_lake_bin_xv)
+yt = log(xv_time_cal_3$chl) # Observed ln(chl) values
+data <- list(y = yt)
+inits <- list(b.0 = 1, b.tp = 1, b.cr = 15, sigma = 1, s.reint = 1, s.rebR = 1, s.reln = 1, s.lake = 1, relake=rep(0,p), reint=rep(0,m), rebR=rep(0,m), reln=rep(0,m))
+
+### Build/Run Model and Obtain Samples
+Nmodel <- nimbleModel(code, constants = constants, data = data, inits = inits) 
+NmodelMCMC <- buildMCMC(Nmodel, monitors2 = c("beta_bR", "beta_int", "beta_ln", "relake"), enableWAIC = TRUE) # REMEMBER TO SET MONITORS
+cNmodel <- compileNimble(Nmodel)
+cNmodelMCMC <- compileNimble(NmodelMCMC, project=Nmodel)
+n.iter = 50000 # REMEMBER TO SET DESIRED NUMBER OF ITERATIONS
+samples <- runMCMC(cNmodelMCMC, niter = n.iter, WAIC = TRUE, nchains = 3, samplesAsCodaMCMC = TRUE, nburnin = 10000) 
+
+
+
+### Summary of Output
+summary(samples$samples) 
+summary(samples$samples2[,1:15]) 
+
+### Rhat Calculations
+gelman.diag(samples$samples) 
+gelman.diag(samples$samples2[,1:15]) 
+
+
+### Make sample statistics a df mean values can be called directly
+samp1 <- data.frame(summary(samples$samples)$statistics)
+samp2 <- data.frame(summary(samples$samples2[,1:15])$statistics)
+
+### Combines all three chains into one chain in order to assess significance (B5 - B1)
+chains1 <- bind_rows(data.frame(samples$samples$chain1),         
+                 bind_rows(data.frame(samples$samples$chain2),
+                           data.frame(samples$samples$chain3)))
+
+chains2 <- bind_rows(data.frame(samples$samples2$chain1[,1:15]),
+                 bind_rows(data.frame(samples$samples2$chain2[,1:15]),
+                           data.frame(samples$samples2$chain3[,1:15])))
+
+
+### Store lists of parameter coefficients
+beta_bR_means <- samp2$Mean[1:5]
+beta_int_means <- samp2$Mean[6:10]
+beta_tp_means <- samp2$Mean[11:15]
+
+
+### Check significance of bin variation parameters
+beta_bR_delta <- chains2[,5] - chains2[,1]                                                    
+beta_bR_sig <- length(beta_bR_delta[beta_bR_delta > 0]) / length(beta_bR_delta); beta_bR_sig
+
+beta_int_delta <- chains2[,10] - chains2[,6]
+beta_int_sig <- length(beta_int_delta[beta_int_delta > 0]) / length(beta_int_delta); beta_int_sig
+
+beta_tp_delta <- chains2[,15] - chains2[,11]
+beta_tp_sig <- length(beta_tp_delta[beta_tp_delta > 0]) / length(beta_tp_delta); beta_tp_sig
+
+### Calculate Predictions
+x.ln = pmin(constants$x.tp,  constants$x.tn/(beta_bR_means[constants$s.j])) #limiting nutrient (units of tp)
+sum(x.ln==constants$x.tp)/length(x.ln) #fraction of time p is limiting
+y.hat = beta_int_means[constants$s.j] + log(x.ln)*(beta_tp_means[constants$s.j]) 
+
+
+# Calculate R2 and RMSE
+y.er=yt-y.hat
+R2=1-sum(y.er^2)/sum((yt-mean(yt))^2); R2 
+rmse <- sqrt(mean(y.er^2)); rmse
+
+# Validation Predictions --------------------------------------------------------------------------
+### Calculate Predictions
+x.ln = pmin(xv_time_val_3$tp,  xv_time_val_3$tn/(beta_bR_means[xv_time_val_3$temp_bin])) #limiting nutrient (units of tp)
+sum(x.ln==xv_time_val_3$tp)/length(x.ln) #fraction of time p is limiting
+y.hat3 = beta_int_means[xv_time_val_3$temp_bin] + log(x.ln)*(beta_tp_means[xv_time_val_3$temp_bin]) 
+
+### Redefine yt
+yt3 = log(xv_time_val_3$chl)
+
+# Calculate R2 and WAIC
+y.er3=yt3-y.hat3
+R2=1-sum(y.er3^2)/sum((yt3-mean(yt3))^2); R2 #R2 = 
+rmse <- sqrt(mean(y.er3^2)); rmse
+```
+
+
+
+
+Fold 4
+```{r Fold 4}
+### Model Formulation
+code <- nimbleCode({
+  b.0 ~ dnorm(0, sd = 10)
+  b.tp ~ dnorm(0, sd = 10)
+  b.cr ~dnorm(20, sd = 5)
+  sigma ~ dunif(0, 10)
+  s.reint ~ dunif(0, 10)
+  s.rebR ~ dunif(0,10)
+  s.reln ~ dunif(0,10)
+  s.lake ~ dunif(0,10)
+  
+  for(i in 1:n) {
+    x.ln[i] <- min(x.tp[i],x.tn[i]/(beta_bR[s.j[i]]))
+    y[i] ~ dnorm(beta_ln[s.j[i]]*log(x.ln[i]) + beta_int[s.j[i]] + relake[s.k[i]], sd = sigma) 
+  }
+  for(j in 1:m) {
+    beta_bR[j] <- b.cr + rebR[j]
+    beta_int[j] <- b.0 + reint[j]
+    beta_ln[j] <- b.tp + reln[j]
+    reint[j] ~ dnorm(0, sd = s.reint)
+    rebR[j] ~ dnorm(0, sd = s.rebR)
+    reln[j] ~ dnorm(0, sd = s.reln)
+  }
+  for (k in 1:p) {
+    relake[k] ~ dnorm(0, sd = s.lake)
+  }
+})
+
+### Dimension Assignment
+n=length(xv_time_cal_4$chl); n
+m=length(unique(xv_time_cal_4$temp_bin)); m
+p=length(unique(xv_time_cal_4$specific_lake_bin)); p
+
+### Prepare data for Nimble model
+constants <- list(n = n, 
+                  m = m, 
+                  x.tp = xv_time_cal_4$tp,
+                  x.tn = xv_time_cal_4$tn,
+                  s.j = xv_time_cal_4$temp_bin,
+                  s.k = xv_time_cal_4$specific_lake_bin_xv)
+yt = log(xv_time_cal_4$chl) # Observed ln(chl) values
+data <- list(y = yt)
+inits <- list(b.0 = 1, b.tp = 1, b.cr = 15, sigma = 1, s.reint = 1, s.rebR = 1, s.reln = 1, s.lake = 1, relake=rep(0,p), reint=rep(0,m), rebR=rep(0,m), reln=rep(0,m))
+
+### Build/Run Model and Obtain Samples
+Nmodel <- nimbleModel(code, constants = constants, data = data, inits = inits) 
+NmodelMCMC <- buildMCMC(Nmodel, monitors2 = c("beta_bR", "beta_int", "beta_ln", "relake"), enableWAIC = TRUE) # REMEMBER TO SET MONITORS
+cNmodel <- compileNimble(Nmodel)
+cNmodelMCMC <- compileNimble(NmodelMCMC, project=Nmodel)
+n.iter = 50000 # REMEMBER TO SET DESIRED NUMBER OF ITERATIONS
+samples <- runMCMC(cNmodelMCMC, niter = n.iter, WAIC = TRUE, nchains = 3, samplesAsCodaMCMC = TRUE, nburnin = 10000) 
+
+
+
+### Summary of Output
+summary(samples$samples) 
+summary(samples$samples2[,1:15]) 
+
+### Rhat Calculations
+gelman.diag(samples$samples) 
+gelman.diag(samples$samples2[,1:15]) 
+
+### Make sample statistics a df mean values can be called directly
+samp1 <- data.frame(summary(samples$samples)$statistics)
+samp2 <- data.frame(summary(samples$samples2[,1:15])$statistics)
+
+### Combines all three chains into one chain in order to assess significance (B5 - B1)
+chains1 <- bind_rows(data.frame(samples$samples$chain1),         
+                 bind_rows(data.frame(samples$samples$chain2),
+                           data.frame(samples$samples$chain3)))
+
+chains2 <- bind_rows(data.frame(samples$samples2$chain1[,1:15]),
+                 bind_rows(data.frame(samples$samples2$chain2[,1:15]),
+                           data.frame(samples$samples2$chain3[,1:15])))
+
+
+### Store lists of parameter coefficients
+beta_bR_means <- samp2$Mean[1:5]
+beta_int_means <- samp2$Mean[6:10]
+beta_tp_means <- samp2$Mean[11:15]
+
+
+### Check significance of bin variation parameters
+beta_bR_delta <- chains2[,5] - chains2[,1]                                                    
+beta_bR_sig <- length(beta_bR_delta[beta_bR_delta > 0]) / length(beta_bR_delta); beta_bR_sig
+
+beta_int_delta <- chains2[,10] - chains2[,6]
+beta_int_sig <- length(beta_int_delta[beta_int_delta > 0]) / length(beta_int_delta); beta_int_sig
+
+beta_tp_delta <- chains2[,15] - chains2[,11]
+beta_tp_sig <- length(beta_tp_delta[beta_tp_delta > 0]) / length(beta_tp_delta); beta_tp_sig
+
+### Calculate Predictions
+x.ln = pmin(constants$x.tp,  constants$x.tn/(beta_bR_means[constants$s.j])) #limiting nutrient (units of tp)
+sum(x.ln==constants$x.tp)/length(x.ln) #fraction of time p is limiting
+y.hat = beta_int_means[constants$s.j] + log(x.ln)*(beta_tp_means[constants$s.j]) 
+
+
+# Calculate R2 and RMSE
+y.er=yt-y.hat
+R2=1-sum(y.er^2)/sum((yt-mean(yt))^2); R2
+rmse <- sqrt(mean(y.er^2)); rmse
+
+# Validation Predictions --------------------------------------------------------------------------
+### Calculate Predictions
+x.ln = pmin(xv_time_val_4$tp,  xv_time_val_4$tn/(beta_bR_means[xv_time_val_4$temp_bin])) #limiting nutrient (units of tp)
+sum(x.ln==xv_time_val_4$tp)/length(x.ln) #fraction of time p is limiting
+y.hat4 = beta_int_means[xv_time_val_4$temp_bin] + log(x.ln)*(beta_tp_means[xv_time_val_4$temp_bin]) 
+
+### Redefine yt
+yt4 = log(xv_time_val_4$chl)
+
+# Calculate R2 and WAIC
+y.er4=yt4-y.hat4
+R2=1-sum(y.er4^2)/sum((yt4-mean(yt4))^2); R2 
+rmse <- sqrt(mean(y.er4^2)); rmse
+```
+
+
+
+
+
+
+
+
+### Combine Errors ------------------------------------------------------------------------------------------------
+```{r Combine Errors - time}
+all_folds_df <- data.frame(y = c(log(xv_time_val_1$chl),log(xv_time_val_2$chl),log(xv_time_val_3$chl),log(xv_time_val_4$chl)), y.er = c(y.er1, y.er2, y.er3, y.er4), y.hat = c(y.hat1, y.hat2, y.hat3, y.hat4))
+
+R2=1-sum(all_folds_df$y.er^2)/sum((all_folds_df$y-mean(all_folds_df$y))^2); R2 
+rmse <- sqrt(mean(all_folds_df$y.er^2)); rmse
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

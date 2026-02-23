@@ -1,0 +1,447 @@
+---
+title: "Cross validation results"
+date: "23 July 2025"
+author: "Brian Baird and Smitom Borah"
+output: html_notebook
+---
+
+# Description
+This notebook contains code used to cross validate the MAV model. First, cleaned NLA data is loaded. Then the dataset is broken into 4 different folds, each with a portion assigned to calibration and a portion assigned to validation. Finally, the results of the seperate folds are combined and visualized. 
+
+# Packages
+```{r echo=TRUE}
+# List of required packages
+packages <- c("nimble", "coda", "ggplot2", "tidyverse", "ggside", "psych")
+
+# Install any that are not already installed
+install_if_missing <- function(p) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    install.packages(p)
+  }
+}
+
+invisible(lapply(packages, install_if_missing))
+
+# Load all packages
+lapply(packages, library, character.only = TRUE)
+```
+
+# Data
+Let us load the data to run the model. The data has been post-processed from the data sources described in the associated research article.
+```{r}
+# load data
+bnla_final <- read.csv("data/bnla_final.csv")
+
+# Add observed TN:TP to dataset
+bnla_final <- mutate(bnla_final, tn_tp = tn / tp)
+lake_mean_n_p <- bnla_final %>%
+  group_by(specific_lake_bin) %>%
+  summarize(mean_lake_tn_tp = mean(tn_tp)) %>%
+  ungroup()
+```
+
+
+# Assign cross validation folds
+
+```{r assign cross validation folds}
+### Assign four different folds using NLA year to divide the data
+
+# xv_time_val_1 <- bnla_final[grep("NLA22", bnla_final$SITE_ID),] 
+xv_time_val_2 <- bnla_final[grep("NLA17", bnla_final$SITE_ID),]
+xv_time_val_3 <- bnla_final[grep("NLA12", bnla_final$SITE_ID),]
+xv_time_val_4 <- bnla_final[grep("NLA06", bnla_final$SITE_ID),]
+xv_time_cal_1 <- bnla_final[-grep("NLA22", bnla_final$SITE_ID),] %>%
+  mutate(specific_lake_bin_xv = as.numeric(as.factor(specific_lake_bin)))
+xv_time_cal_2 <- bnla_final[-grep("NLA17", bnla_final$SITE_ID),] %>%
+  mutate(specific_lake_bin_xv = as.numeric(as.factor(specific_lake_bin)))
+xv_time_cal_3 <- bnla_final[-grep("NLA12", bnla_final$SITE_ID),] %>%
+  mutate(specific_lake_bin_xv = as.numeric(as.factor(specific_lake_bin)))
+xv_time_cal_4 <- bnla_final[-grep("NLA06", bnla_final$SITE_ID),] %>%
+  mutate(specific_lake_bin_xv = as.numeric(as.factor(specific_lake_bin)))
+```
+
+## Fold 1 
+```{r Fold 1}
+# Model Formulation
+code <- nimbleCode({
+  b0.int ~ dnorm(0, sd = 10)
+  b0.R ~ dnorm(20, sd = 10)
+  b1.R.depth ~ dnorm(0, sd = 10)
+  b0.slope ~ dnorm(0, sd = 10)
+  b1.slope.temp ~ dnorm(0, sd = 10)
+  sigma ~ dunif(0, 10)
+  s.lake ~ dunif(0,10)
+
+  for(i in 1:n) {
+    x.ln[i] <- min(x.tp[i] , x.tn[i]/max((b1.R.depth * (log(x.depth[i]) - mu.log.depth) + b0.R), 1))  ### Using original scale for slope of temperature (slope coefficient)
+    y[i] ~ dnorm((b1.slope.temp * (x.T[i] - mu.T) + b0.slope)*log(x.ln[i]) + b0.int + relake[s.k[i]], sd = sigma)
+  }
+  for (k in 1:p) {
+    relake[k] ~ dnorm(0, sd = s.lake)
+  }
+})
+
+
+
+# Dimension Assignment
+n=length(xv_time_cal_1$chl); n
+p=length(unique(xv_time_cal_1$specific_lake_bin_xv)); p
+mu.T = mean(xv_time_cal_1$avg_temp)
+mu.log.depth = mean(log(xv_time_cal_1$INDEX_SITE_DEPTH))
+mu.log.tp = mean(log(xv_time_cal_1$tp))
+mu.log.tp.2 = mean(log(xv_time_cal_1$tp)^2)
+
+# Prepare data for Nimble model
+constants <- list(n = n, 
+                  p = p,
+                  mu.T = mu.T,
+                  mu.log.depth = mu.log.depth,
+                  mu.log.tp = mu.log.tp,
+                  mu.log.tp.2 = mu.log.tp.2,
+                  x.tp = xv_time_cal_1$tp,
+                  x.tn = xv_time_cal_1$tn,
+                  x.T = xv_time_cal_1$avg_temp,
+                  x.eutro = xv_time_cal_1$log_eutro,
+                  x.depth = xv_time_cal_1$INDEX_SITE_DEPTH,
+                  s.k = xv_time_cal_1$specific_lake_bin_xv)
+yt = log(xv_time_cal_1$chl)
+data <- list(y = yt)
+inits <- list(b0.int = 1, b0.int.depth = 1,  b1.R.temp = 1, b1.R.depth = 1, b1.R.tp = 1, b0.R = 1, b1.slope.temp = 1, b1.slope.depth = 1, b0.slope = 1, sigma = 1, s.lake = 1, relake=rep(0,p))
+
+# Build/Run Model and Obtain Samples
+Nmodel <- nimbleModel(code, constants = constants, data = data, inits = inits) 
+NmodelMCMC <- buildMCMC(Nmodel, monitors2 = c("relake"), enableWAIC = TRUE) # REMEMBER TO SET MONITORS
+cNmodel <- compileNimble(Nmodel)
+cNmodelMCMC <- compileNimble(NmodelMCMC, project=Nmodel)
+n.iter = 60000 
+samples <- runMCMC(cNmodelMCMC, niter = n.iter, WAIC = TRUE, nchains = 3, samplesAsCodaMCMC = TRUE, nburnin = 20000) 
+
+
+
+# Summary of Output
+summary(samples$samples) 
+
+# Rhat Calculations
+gelman.diag(samples$samples) 
+
+### Make sample statistics a df mean values can be called directly
+samp1 <- data.frame(summary(samples$samples)$statistics)
+
+# Calculate Predictions
+x.ln = pmin(constants$x.tp,  constants$x.tn/pmax((samp1["b1.R.depth","Mean"] * (log(constants$x.depth) - mu.log.depth) + samp1["b0.R", "Mean"]), 1))  #limiting nutrient (units of tp)
+sum(x.ln==constants$x.tp)/length(x.ln) #fraction of time p is limiting
+y.hat = (samp1["b0.int", "Mean"] + log(x.ln)*(samp1["b1.slope.temp","Mean"] * (constants$x.T - mu.T) + samp1["b0.slope","Mean"])) 
+
+# Calculate R2 and rmse
+y.er=yt-y.hat
+R2=1-sum(y.er^2)/sum((yt-mean(yt))^2); R2
+rmse <- sqrt(mean(y.er^2)); rmse
+
+# Validation Predictions --------------------------------------------------------------------------
+## Calculate Predictions
+x.ln = pmin(xv_time_val_1$tp,  xv_time_val_1$tn/pmax((samp1["b1.R.depth","Mean"] * (log(xv_time_val_1$INDEX_SITE_DEPTH) - mu.log.depth) + samp1["b0.R", "Mean"]), 1))  #limiting nutrient (units of tp)
+sum(x.ln==xv_time_val_1$tp)/length(x.ln) #fraction of time p is limiting
+y.hat1 = (samp1["b0.int", "Mean"] + log(x.ln)*(samp1["b1.slope.temp","Mean"] * (xv_time_val_1$avg_temp - mu.T) + samp1["b0.slope","Mean"])) 
+
+## Redefine yt
+yt1 = log(xv_time_val_1$chl)
+
+
+## Calculate R2 and rmse
+y.er1=yt1-y.hat1
+R2=1-sum(y.er1^2)/sum((yt1-mean(yt1))^2); R2
+rmse <- sqrt(mean(y.er1^2)); rmse
+```
+## Fold 2
+```{r Fold 2}
+# Model Formulation
+code <- nimbleCode({
+  b0.int ~ dnorm(0, sd = 10)
+  b0.R ~ dnorm(20, sd = 10)
+  b1.R.depth ~ dnorm(0, sd = 10)
+  b0.slope ~ dnorm(0, sd = 10)
+  b1.slope.temp ~ dnorm(0, sd = 10)
+  sigma ~ dunif(0, 10)
+  s.lake ~ dunif(0,10)
+
+  for(i in 1:n) {
+    x.ln[i] <- min(x.tp[i] , x.tn[i]/max((b1.R.depth * (log(x.depth[i]) - mu.log.depth) + b0.R), 1))  ### Using original scale for slope of temperature (slope coefficient)
+    y[i] ~ dnorm((b1.slope.temp * (x.T[i] - mu.T) + b0.slope)*log(x.ln[i]) + b0.int + relake[s.k[i]], sd = sigma)
+  }
+  for (k in 1:p) {
+    relake[k] ~ dnorm(0, sd = s.lake)
+  }
+})
+
+
+
+# Dimension Assignment
+n=length(xv_time_cal_2$chl); n
+p=length(unique(xv_time_cal_2$specific_lake_bin_xv)); p
+mu.T = mean(xv_time_cal_2$avg_temp)
+mu.log.depth = mean(log(xv_time_cal_2$INDEX_SITE_DEPTH))
+mu.log.tp = mean(log(xv_time_cal_2$tp))
+mu.log.tp.2 = mean(log(xv_time_cal_2$tp)^2)
+
+# Prepare data for Nimble model
+constants <- list(n = n, 
+                  p = p,
+                  mu.T = mu.T,
+                  mu.log.depth = mu.log.depth,
+                  mu.log.tp = mu.log.tp,
+                  mu.log.tp.2 = mu.log.tp.2,
+                  x.tp = xv_time_cal_2$tp,
+                  x.tn = xv_time_cal_2$tn,
+                  x.T = xv_time_cal_2$avg_temp,
+                  x.eutro = xv_time_cal_2$log_eutro,
+                  x.depth = xv_time_cal_2$INDEX_SITE_DEPTH,
+                  s.k = xv_time_cal_2$specific_lake_bin_xv)
+yt = log(xv_time_cal_2$chl)
+data <- list(y = yt)
+inits <- list(b0.int = 1, b0.int.depth = 1,  b1.R.temp = 1, b1.R.depth = 1, b1.R.tp = 1, b0.R = 1, b1.slope.temp = 1, b1.slope.depth = 1, b0.slope = 1, sigma = 1, s.lake = 1, relake=rep(0,p))
+
+# Build/Run Model and Obtain Samples
+Nmodel <- nimbleModel(code, constants = constants, data = data, inits = inits) 
+NmodelMCMC <- buildMCMC(Nmodel, monitors2 = c("relake"), enableWAIC = TRUE) # REMEMBER TO SET MONITORS
+cNmodel <- compileNimble(Nmodel)
+cNmodelMCMC <- compileNimble(NmodelMCMC, project=Nmodel)
+n.iter = 60000 
+samples <- runMCMC(cNmodelMCMC, niter = n.iter, WAIC = TRUE, nchains = 3, samplesAsCodaMCMC = TRUE, nburnin = 20000) 
+
+# Summary of Output
+summary(samples$samples)
+
+# Rhat Calculations
+gelman.diag(samples$samples) 
+
+# Make sample statistics a df mean values can be called directly
+samp1 <- data.frame(summary(samples$samples)$statistics)
+
+
+# Calculate Predictions
+x.ln = pmin(constants$x.tp,  constants$x.tn/pmax((samp1["b1.R.depth","Mean"] * (log(constants$x.depth) - mu.log.depth) + samp1["b0.R", "Mean"]), 1))  #limiting nutrient (units of tp)
+sum(x.ln==constants$x.tp)/length(x.ln) #fraction of time p is limiting
+y.hat = (samp1["b0.int", "Mean"] + log(x.ln)*(samp1["b1.slope.temp","Mean"] * (constants$x.T - mu.T) + samp1["b0.slope","Mean"])) 
+
+# Calculate R2 and rmse
+y.er=yt-y.hat
+R2=1-sum(y.er^2)/sum((yt-mean(yt))^2); R2
+rmse <- sqrt(mean(y.er^2)); rmse
+
+# Validation Predictions --------------------------------------------------------------------------
+## Calculate Predictions
+x.ln = pmin(xv_time_val_2$tp,  xv_time_val_2$tn/pmax((samp1["b1.R.depth","Mean"] * (log(xv_time_val_2$INDEX_SITE_DEPTH) - mu.log.depth) + samp1["b0.R", "Mean"]), 1))  #limiting nutrient (units of tp)
+sum(x.ln==xv_time_val_2$tp)/length(x.ln) #fraction of time p is limiting
+y.hat2 = (samp1["b0.int", "Mean"] + log(x.ln)*(samp1["b1.slope.temp","Mean"] * (xv_time_val_2$avg_temp - mu.T) + samp1["b0.slope","Mean"])) 
+
+## Redefine yt
+yt2 = log(xv_time_val_2$chl)
+
+
+# Calculate R2 and rmse
+y.er2=yt2-y.hat2
+R2=1-sum(y.er2^2)/sum((yt2-mean(yt2))^2); R2 
+rmse <- sqrt(mean(y.er2^2)); rmse
+```
+
+## Fold 3 
+```{r Fold 3}
+# Model Formulation
+code <- nimbleCode({
+  b0.int ~ dnorm(0, sd = 10)
+  b0.R ~ dnorm(20, sd = 10)
+  b1.R.depth ~ dnorm(0, sd = 10)
+  b0.slope ~ dnorm(0, sd = 10)
+  b1.slope.temp ~ dnorm(0, sd = 10)
+  sigma ~ dunif(0, 10)
+  s.lake ~ dunif(0,10)
+
+  for(i in 1:n) {
+    x.ln[i] <- min(x.tp[i] , x.tn[i]/max((b1.R.depth * (log(x.depth[i]) - mu.log.depth) + b0.R), 1))  ### Using original scale for slope of temperature (slope coefficient)
+    y[i] ~ dnorm((b1.slope.temp * (x.T[i] - mu.T) + b0.slope)*log(x.ln[i]) + b0.int + relake[s.k[i]], sd = sigma)
+  }
+  for (k in 1:p) {
+    relake[k] ~ dnorm(0, sd = s.lake)
+  }
+})
+
+
+
+# Dimension Assignment
+n=length(xv_time_cal_3$chl); n
+p=length(unique(xv_time_cal_3$specific_lake_bin_xv)); p
+mu.T = mean(xv_time_cal_3$avg_temp)
+mu.log.depth = mean(log(xv_time_cal_3$INDEX_SITE_DEPTH))
+mu.log.tp = mean(log(xv_time_cal_3$tp))
+mu.log.tp.2 = mean(log(xv_time_cal_3$tp)^2)
+
+# Prepare data for Nimble model
+constants <- list(n = n, 
+                  p = p,
+                  mu.T = mu.T,
+                  mu.log.depth = mu.log.depth,
+                  mu.log.tp = mu.log.tp,
+                  mu.log.tp.2 = mu.log.tp.2,
+                  x.tp = xv_time_cal_3$tp,
+                  x.tn = xv_time_cal_3$tn,
+                  x.T = xv_time_cal_3$avg_temp,
+                  x.eutro = xv_time_cal_3$log_eutro,
+                  x.depth = xv_time_cal_3$INDEX_SITE_DEPTH,
+                  s.k = xv_time_cal_3$specific_lake_bin_xv)
+yt = log(xv_time_cal_3$chl)
+data <- list(y = yt)
+inits <- list(b0.int = 1, b0.int.depth = 1,  b1.R.temp = 1, b1.R.depth = 1, b1.R.tp = 1, b0.R = 1, b1.slope.temp = 1, b1.slope.depth = 1, b0.slope = 1, sigma = 1, s.lake = 1, relake=rep(0,p))
+
+# Build/Run Model and Obtain Samples
+Nmodel <- nimbleModel(code, constants = constants, data = data, inits = inits) 
+NmodelMCMC <- buildMCMC(Nmodel, monitors2 = c("relake"), enableWAIC = TRUE) 
+cNmodel <- compileNimble(Nmodel)
+cNmodelMCMC <- compileNimble(NmodelMCMC, project=Nmodel)
+n.iter = 60000 
+samples <- runMCMC(cNmodelMCMC, niter = n.iter, WAIC = TRUE, nchains = 3, samplesAsCodaMCMC = TRUE, nburnin = 20000) 
+
+
+# Summary of Output
+summary(samples$samples) 
+
+
+# Rhat Calculations
+gelman.diag(samples$samples) 
+
+
+# Make sample statistics a df mean values can be called directly
+samp1 <- data.frame(summary(samples$samples)$statistics)
+
+# Calculate Predictions
+x.ln = pmin(constants$x.tp,  constants$x.tn/pmax((samp1["b1.R.depth","Mean"] * (log(constants$x.depth) - mu.log.depth) + samp1["b0.R", "Mean"]), 1))  #limiting nutrient (units of tp)
+sum(x.ln==constants$x.tp)/length(x.ln) #fraction of time p is limiting
+y.hat = (samp1["b0.int", "Mean"] + log(x.ln)*(samp1["b1.slope.temp","Mean"] * (constants$x.T - mu.T) + samp1["b0.slope","Mean"])) 
+
+# Calculate R2 and rmse
+y.er=yt-y.hat
+R2=1-sum(y.er^2)/sum((yt-mean(yt))^2); R2 
+rmse <- sqrt(mean(y.er^2)); rmse
+
+# Validation Predictions --------------------------------------------------------------------------
+## Calculate Predictions
+x.ln = pmin(xv_time_val_3$tp,  xv_time_val_3$tn/pmax((samp1["b1.R.depth","Mean"] * (log(xv_time_val_3$INDEX_SITE_DEPTH) - mu.log.depth) + samp1["b0.R", "Mean"]), 1))  #limiting nutrient (units of tp)
+sum(x.ln==xv_time_val_3$tp)/length(x.ln) #fraction of time p is limiting
+y.hat3 = (samp1["b0.int", "Mean"] + log(x.ln)*(samp1["b1.slope.temp","Mean"] * (xv_time_val_3$avg_temp - mu.T) + samp1["b0.slope","Mean"])) 
+
+## Redefine yt
+yt3 = log(xv_time_val_3$chl)
+
+# Calculate R2 and rmse
+y.er3=yt3-y.hat3
+R2=1-sum(y.er3^2)/sum((yt3-mean(yt3))^2); R2 
+rmse <- sqrt(mean(y.er3^2)); rmse
+```
+
+## Fold 4
+```{r Fold 4}
+# Model Formulation
+code <- nimbleCode({
+  b0.int ~ dnorm(0, sd = 10)
+  b0.R ~ dnorm(20, sd = 10)
+  b1.R.depth ~ dnorm(0, sd = 10)
+  b0.slope ~ dnorm(0, sd = 10)
+  b1.slope.temp ~ dnorm(0, sd = 10)
+  sigma ~ dunif(0, 10)
+  s.lake ~ dunif(0,10)
+
+  for(i in 1:n) {
+    x.ln[i] <- min(x.tp[i] , x.tn[i]/max((b1.R.depth * (log(x.depth[i]) - mu.log.depth) + b0.R), 1))  ### Using original scale for slope of temperature (slope coefficient)
+    y[i] ~ dnorm((b1.slope.temp * (x.T[i] - mu.T) + b0.slope)*log(x.ln[i]) + b0.int + relake[s.k[i]], sd = sigma)
+  }
+  for (k in 1:p) {
+    relake[k] ~ dnorm(0, sd = s.lake)
+  }
+})
+
+
+
+# Dimension Assignment
+n=length(xv_time_cal_4$chl); n
+p=length(unique(xv_time_cal_4$specific_lake_bin_xv)); p
+mu.T = mean(xv_time_cal_4$avg_temp)
+mu.log.depth = mean(log(xv_time_cal_4$INDEX_SITE_DEPTH))
+mu.log.tp = mean(log(xv_time_cal_4$tp))
+mu.log.tp.2 = mean(log(xv_time_cal_4$tp)^2)
+
+# Prepare data for Nimble model
+constants <- list(n = n, 
+                  p = p,
+                  mu.T = mu.T,
+                  mu.log.depth = mu.log.depth,
+                  mu.log.tp = mu.log.tp,
+                  mu.log.tp.2 = mu.log.tp.2,
+                  x.tp = xv_time_cal_4$tp,
+                  x.tn = xv_time_cal_4$tn,
+                  x.T = xv_time_cal_4$avg_temp,
+                  x.eutro = xv_time_cal_4$log_eutro,
+                  x.depth = xv_time_cal_4$INDEX_SITE_DEPTH,
+                  s.k = xv_time_cal_4$specific_lake_bin_xv)
+yt = log(xv_time_cal_4$chl)
+data <- list(y = yt)
+inits <- list(b0.int = 1, b0.int.depth = 1,  b1.R.temp = 1, b1.R.depth = 1, b1.R.tp = 1, b0.R = 1, b1.slope.temp = 1, b1.slope.depth = 1, b0.slope = 1, sigma = 1, s.lake = 1, relake=rep(0,p))
+
+# Build/Run Model and Obtain Samples
+Nmodel <- nimbleModel(code, constants = constants, data = data, inits = inits) 
+NmodelMCMC <- buildMCMC(Nmodel, monitors2 = c("relake"), enableWAIC = TRUE)
+cNmodel <- compileNimble(Nmodel)
+cNmodelMCMC <- compileNimble(NmodelMCMC, project=Nmodel)
+n.iter = 60000 
+samples <- runMCMC(cNmodelMCMC, niter = n.iter, WAIC = TRUE, nchains = 3, samplesAsCodaMCMC = TRUE, nburnin = 20000) 
+
+# Summary of Output
+summary(samples$samples) 
+
+# Rhat Calculations
+gelman.diag(samples$samples) 
+
+# Make sample statistics a df mean values can be called directly
+samp1 <- data.frame(summary(samples$samples)$statistics)
+
+# Calculate Predictions
+x.ln = pmin(constants$x.tp,  constants$x.tn/pmax((samp1["b1.R.depth","Mean"] * (log(constants$x.depth) - mu.log.depth) + samp1["b0.R", "Mean"]), 1))  #limiting nutrient (units of tp)
+sum(x.ln==constants$x.tp)/length(x.ln) #fraction of time p is limiting
+y.hat = (samp1["b0.int", "Mean"] + log(x.ln)*(samp1["b1.slope.temp","Mean"] * (constants$x.T - mu.T) + samp1["b0.slope","Mean"])) 
+
+# Calculate R2 and rmse
+y.er=yt-y.hat
+R2=1-sum(y.er^2)/sum((yt-mean(yt))^2); R2 
+rmse <- sqrt(mean(y.er^2)); rmse
+
+# Validation Predictions --------------------------------------------------------------------------
+## Calculate Predictions
+x.ln = pmin(xv_time_val_4$tp,  xv_time_val_4$tn/pmax((samp1["b1.R.depth","Mean"] * (log(xv_time_val_4$INDEX_SITE_DEPTH) - mu.log.depth) + samp1["b0.R", "Mean"]), 1))  #limiting nutrient (units of tp)
+sum(x.ln==xv_time_val_4$tp)/length(x.ln) #fraction of time p is limiting
+y.hat4 = (samp1["b0.int", "Mean"] + log(x.ln)*(samp1["b1.slope.temp","Mean"] * (xv_time_val_4$avg_temp - mu.T) + samp1["b0.slope","Mean"])) 
+
+## Redefine yt
+yt4 = log(xv_time_val_4$chl)
+
+## Calculate R2 and rmse
+y.er4=yt4-y.hat4
+R2=1-sum(y.er4^2)/sum((yt4-mean(yt4))^2); R2 
+rmse <- sqrt(mean(y.er4^2)); rmse
+```
+
+## Combine Errors
+```{r Combine Errors - time}
+all_folds_df <- data.frame(y = c(log(xv_time_val_1$chl),log(xv_time_val_2$chl),log(xv_time_val_3$chl),log(xv_time_val_4$chl)), y.er = c(y.er1, y.er2, y.er3, y.er4), y.hat = c(y.hat1, y.hat2, y.hat3, y.hat4))
+
+R2=1-sum(all_folds_df$y.er^2)/sum((all_folds_df$y-mean(all_folds_df$y))^2); R2
+rmse <- sqrt(mean(all_folds_df$y.er^2)); rmse
+
+```
+
+
+
+
+
+
+
+
+
+

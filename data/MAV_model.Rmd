@@ -1,0 +1,144 @@
+---
+title: "Multiple Auxillary Variable (MAV) Models"
+date: "22 July 2025"
+author: "Brian Baird and Smitom Borah"
+output: html_notebook
+---
+
+# Description
+This notebook contains code for the final MAV model identified after backwards variable selection.
+
+# Packages
+```{r echo=TRUE}
+# List of required packages
+packages <- c("nimble", "coda", "ggplot2", "tidyverse", "ggside")
+
+# Install any that are not already installed
+install_if_missing <- function(p) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    install.packages(p)
+  }
+}
+
+invisible(lapply(packages, install_if_missing))
+
+# Load all packages
+lapply(packages, library, character.only = TRUE)
+```
+
+# Data
+Let us load the data to run the model. The data has been post-processed from the data sources described in the associated research article.
+```{r}
+# load data
+bnla_final <- read.csv("data/bnla_final.csv")
+
+# Add observed TN:TP to dataset
+bnla_final <- mutate(bnla_final, tn_tp = tn / tp)
+lake_mean_n_p <- bnla_final %>%
+  group_by(specific_lake_bin) %>%
+  summarize(mean_lake_tn_tp = mean(tn_tp)) %>%
+  ungroup()
+```
+
+# MAV model
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+# Model Formulation
+code <- nimbleCode({
+  b0.int ~ dnorm(0, sd = 10)
+  b0.R ~ dnorm(20, sd = 10)
+  b1.R.depth ~ dnorm(0, sd = 10)
+  b0.slope ~ dnorm(0, sd = 10)
+  b1.slope.temp ~ dnorm(0, sd = 10)
+  sigma ~ dunif(0, 10)
+  s.lake ~ dunif(0,10)
+
+  for(i in 1:n) {
+    x.ln[i] <- min(x.tp[i] , x.tn[i]/max((b1.R.depth * (log(x.depth[i]) - mu.log.depth) + b0.R), 1))  ### Using original scale for slope of temperature (slope coefficient)
+    y[i] ~ dnorm((b1.slope.temp * (x.T[i] - mu.T) + b0.slope)*log(x.ln[i]) + b0.int + relake[s.k[i]], sd = sigma)
+  }
+  for (k in 1:p) {
+    relake[k] ~ dnorm(0, sd = s.lake)
+  }
+})
+
+# Dimension Assignment
+n=length(bnla_final$chl); n
+p=length(unique(bnla_final$specific_lake_bin)); p
+mu.T = mean(bnla_final$avg_temp)
+mu.log.depth = mean(log(bnla_final$INDEX_SITE_DEPTH))
+mu.log.tp = mean(log(bnla_final$tp))
+mu.log.tp.2 = mean(log(bnla_final$tp)^2)
+
+# Prepare data for Nimble model
+constants <- list(n = n, 
+                  p = p,
+                  mu.T = mu.T,
+                  mu.log.depth = mu.log.depth,
+                  x.tp = bnla_final$tp,
+                  x.tn = bnla_final$tn,
+                  x.T = bnla_final$avg_temp,
+                  x.depth = bnla_final$INDEX_SITE_DEPTH,
+                  s.k = bnla_final$specific_lake_bin)
+yt = log(bnla_final$chl)
+data <- list(y = yt)
+inits <- list(b0.int = 1, b1.R.depth = 1, b0.R = 1, b1.slope.temp = 1, b0.slope = 1, sigma = 1, s.lake = 1, relake=rep(0,p))
+
+# Build/Run Model and Obtain Samples
+Nmodel <- nimbleModel(code, constants = constants, data = data, inits = inits) 
+NmodelMCMC <- buildMCMC(Nmodel, monitors2 = c("relake"), enableWAIC = TRUE) 
+cNmodel <- compileNimble(Nmodel)
+cNmodelMCMC <- compileNimble(NmodelMCMC, project=Nmodel)
+n.iter = 60000 # Desired number of iterations
+samples <- runMCMC(cNmodelMCMC, niter = n.iter, WAIC = TRUE, nchains = 3, samplesAsCodaMCMC = TRUE, nburnin = 20000) 
+
+# Save model
+samples_mav <- samples
+```
+
+Here is the performance of the model:
+
+```{r}
+# Model
+samples <- samples_mav
+
+# Summary of Output
+summary(samples$samples) 
+
+# Rhat Calculations
+gelman.diag(samples$samples) 
+
+# Make sample statistics a df mean values can be called directly
+samp1 <- data.frame(summary(samples$samples)$statistics); samp1
+
+
+# Calculate Predictions
+x.ln = pmin(constants$x.tp,  constants$x.tn/pmax((samp1["b1.R.depth","Mean"] * (log(constants$x.depth) - mu.log.depth) + samp1["b0.R", "Mean"]), 1))  #limiting nutrient (units of tp)
+sum(x.ln==constants$x.tp)/length(x.ln) #fraction of time p is limiting
+y.hat = (samp1["b0.int", "Mean"] + log(x.ln)*(samp1["b1.slope.temp","Mean"] * (constants$x.T - mu.T) + samp1["b0.slope","Mean"])) 
+
+## Means of dpeth and temperature
+mu.log.depth
+mu.T
+
+# Calculate R2 and rmse
+y.er=yt-y.hat
+R2=1-sum(y.er^2)/sum((yt-mean(yt))^2); R2 
+rmse <- sqrt(mean(y.er^2)); rmse
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

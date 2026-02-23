@@ -1,0 +1,761 @@
+---
+title: "Individual Auxillary Variable (IAV) Models"
+date: "16 July 2025"
+author: "Brian Baird and Smitom Borah"
+output: html_notebook
+---
+
+# Description
+This R notebook contains code necessary to run the individual auxiliary variable (IAV) models with and without binning coefficients. Coefficients are binned based on nutrient enrichment index, depth, and temperature.
+
+# Packages
+```{r echo=TRUE}
+# List of required packages
+packages <- c("nimble", "coda", "ggplot2", "tidyverse", "ggside")
+
+# Install any that are not already installed
+install_if_missing <- function(p) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    install.packages(p)
+  }
+}
+
+invisible(lapply(packages, install_if_missing))
+
+# Load all packages
+lapply(packages, library, character.only = TRUE)
+```
+# Data
+Let us load the data to run the model. The data has been post-processed from the data sources described in the associated research article.
+```{r}
+# load data
+bnla_final <- read.csv("data/bnla_final.csv")
+```
+
+# Preliminary models based on limiting nutrient
+## Binning based on enrichment index
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+# Model Formulation
+code <- nimbleCode({
+  b.0 ~ dnorm(0, sd = 10)
+  b.tp ~ dnorm(0, sd = 10)
+  b.cr ~dnorm(20, sd = 5)
+  sigma ~ dunif(0, 10)
+  s.reint ~ dunif(0, 10)
+  s.rebR ~ dunif(0,10)
+  s.reln ~ dunif(0,10)
+  s.lake ~ dunif(0,10)
+  
+  for(i in 1:n) {
+    x.ln[i] <- min(x.tp[i],x.tn[i]/(beta_bR[s.j[i]]))
+    y[i] ~ dnorm(beta_ln[s.j[i]]*log(x.ln[i]) + beta_int[s.j[i]] + relake[s.k[i]], sd = sigma) 
+  }
+  for(j in 1:m) {
+    beta_bR[j] <- b.cr + rebR[j]
+    beta_int[j] <- b.0 + reint[j]
+    beta_ln[j] <- b.tp + reln[j]
+    reint[j] ~ dnorm(0, sd = s.reint)
+    rebR[j] ~ dnorm(0, sd = s.rebR)
+    reln[j] ~ dnorm(0, sd = s.reln)
+  }
+  for (k in 1:p) {
+    relake[k] ~ dnorm(0, sd = s.lake)
+  }
+})
+
+# Dimension Assignment
+n=length(bnla_final$chl); n
+m=length(unique(bnla_final$eutro_bin)); m
+p=length(unique(bnla_final$specific_lake_bin)); p
+
+# Prepare bnla_finala for Nimble model
+constants <- list(n = n,
+                  m = m,
+                  p = p,
+                  x.tp = bnla_final$tp,
+                  x.tn = bnla_final$tn,
+                  s.j = bnla_final$eutro_bin,
+                  s.k = bnla_final$specific_lake_bin)
+yt = log(bnla_final$chl) # Observed ln(chl) values
+data <- list(y = yt)
+inits <- list(b.0 = 1, b.tp = 1, b.cr = 15, sigma = 1, s.reint = 1, s.rebR = 1, s.reln = 1, s.lake = 1, relake=rep(0,p), reint=rep(0,m), rebR=rep(0,m), reln=rep(0,m))
+
+# Build/Run Model and Obtain Samples
+Nmodel <- nimbleModel(code, constants = constants, data = data, inits = inits) 
+NmodelMCMC <- buildMCMC(Nmodel, monitors2 = c("beta_bR", "beta_int", "beta_ln", "relake"), enableWAIC = TRUE) 
+cNmodel <- compileNimble(Nmodel)
+cNmodelMCMC <- compileNimble(NmodelMCMC, project=Nmodel)
+n.iter = 50000 # Desired number of iterations
+samples <- runMCMC(cNmodelMCMC, niter = n.iter, WAIC = TRUE, nchains = 3, samplesAsCodaMCMC = TRUE, nburnin = 10000) 
+
+# Save model
+samples_nei <- samples
+```
+
+Here is the performance of the model:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+# Model
+samples <- samples_nei
+
+# Summary of Output
+summary(samples$samples) 
+summary(samples$samples2[,1:15]) 
+
+# Rhat Calculations
+gelman.diag(samples$samples) 
+gelman.diag(samples$samples2[,1:15]) 
+
+# Make sample statistics a df mean values can be called directly
+samp2 <- data.frame(summary(samples$samples2[,1:15])$statistics)
+
+# Store lists of parameter coefficients
+beta_bR_means <- samp2$Mean[1:5]; beta_bR_means
+beta_int_means <- samp2$Mean[6:10]; beta_int_means
+beta_tp_means <- samp2$Mean[11:15]; beta_tp_means
+
+# Calculate Predictions
+x.ln = pmin(constants$x.tp,  constants$x.tn/(beta_bR_means[constants$s.j])) #limiting nutrient (units of tp)
+sum(x.ln==constants$x.tp)/length(x.ln) #fraction of time p is limiting
+y.hat = beta_int_means[constants$s.j] + log(x.ln)*(beta_tp_means[constants$s.j])
+
+# Calculate model performance
+## R2
+y.er=yt-y.hat
+R2=1-sum(y.er^2)/sum((yt-mean(yt))^2); R2 
+
+## RMSE
+rmse <- sqrt(mean(y.er^2)); rmse
+```
+
+
+## Binning based on depth
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+# Model Formulation
+code <- nimbleCode({
+  b.0 ~ dnorm(0, sd = 10)
+  b.tp ~ dnorm(0, sd = 10)
+  b.cr ~dnorm(20, sd = 5)
+  sigma ~ dunif(0, 10)
+  s.reint ~ dunif(0, 10)
+  s.rebR ~ dunif(0,10)
+  s.reln ~ dunif(0,10)
+  s.lake ~ dunif(0,10)
+  
+  for(i in 1:n) {
+    x.ln[i] <- min(x.tp[i],x.tn[i]/(beta_bR[s.j[i]]))
+    y[i] ~ dnorm(beta_ln[s.j[i]]*log(x.ln[i]) + beta_int[s.j[i]] + relake[s.k[i]], sd = sigma) 
+  }
+  for(j in 1:m) {
+    beta_bR[j] <- b.cr + rebR[j]
+    beta_int[j] <- b.0 + reint[j]
+    beta_ln[j] <- b.tp + reln[j]
+    reint[j] ~ dnorm(0, sd = s.reint)
+    rebR[j] ~ dnorm(0, sd = s.rebR)
+    reln[j] ~ dnorm(0, sd = s.reln)
+  }
+  for (k in 1:p) {
+    relake[k] ~ dnorm(0, sd = s.lake)
+  }
+})
+
+# Dimension Assignment
+n=length(bnla_final$chl); n
+m=length(unique(bnla_final$depth_bin)); m
+p=length(unique(bnla_final$specific_lake_bin)); p
+
+# Prepare data for Nimble model
+constants <- list(n = n, 
+                  m = m, 
+                  p = p,
+                  x.tp = bnla_final$tp,
+                  x.tn = bnla_final$tn,
+                  s.j = bnla_final$depth_bin,
+                  s.k = bnla_final$specific_lake_bin)
+yt = log(bnla_final$chl) # Observed ln(chl) values
+data <- list(y = yt)
+inits <- list(b.0 = 1, b.tp = 1, b.cr = 15, sigma = 1, s.reint = 1, s.rebR = 1, s.reln = 1, s.lake = 1, relake=rep(0,p), reint=rep(0,m), rebR=rep(0,m), reln=rep(0,m))
+
+# Build/Run Model and Obtain Samples
+Nmodel <- nimbleModel(code, constants = constants, data = data, inits = inits) 
+NmodelMCMC <- buildMCMC(Nmodel, monitors2 = c("beta_bR", "beta_int", "beta_ln", "relake"), enableWAIC = TRUE) 
+cNmodel <- compileNimble(Nmodel)
+cNmodelMCMC <- compileNimble(NmodelMCMC, project=Nmodel)
+n.iter = 50000 # Desired number of iterations
+samples <- runMCMC(cNmodelMCMC, niter = n.iter, WAIC = TRUE, nchains = 3, samplesAsCodaMCMC = TRUE, nburnin = 10000) 
+
+# Save model
+samples_depth <- samples
+```
+
+Here is the performance of the model:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+# Model
+samples <- samples_depth
+
+# Summary of Output
+summary(samples$samples) 
+summary(samples$samples2[,1:15]) 
+
+# Rhat Calculations
+gelman.diag(samples$samples) 
+gelman.diag(samples$samples2[,1:15]) 
+
+# Make sample statistics a df mean values can be called directly
+samp2 <- data.frame(summary(samples$samples2[,1:15])$statistics)
+
+# Store lists of parameter coefficients
+beta_bR_means <- samp2$Mean[1:5]; beta_bR_means
+beta_int_means <- samp2$Mean[6:10]; beta_int_means
+beta_tp_means <- samp2$Mean[11:15]; beta_tp_means
+
+# Calculate Predictions
+x.ln = pmin(constants$x.tp,  constants$x.tn/(beta_bR_means[constants$s.j])) #limiting nutrient (units of tp)
+sum(x.ln==constants$x.tp)/length(x.ln) #fraction of time p is limiting
+y.hat = beta_int_means[constants$s.j] + log(x.ln)*(beta_tp_means[constants$s.j])
+
+# Calculate model performance
+## R2
+y.er=yt-y.hat
+R2=1-sum(y.er^2)/sum((yt-mean(yt))^2); R2 
+
+## RMSE
+rmse <- sqrt(mean(y.er^2)); rmse
+```
+
+
+## Binning based on temperature
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+# Model Formulation
+code <- nimbleCode({
+  b.0 ~ dnorm(0, sd = 10)
+  b.tp ~ dnorm(0, sd = 10)
+  b.cr ~dnorm(20, sd = 5)
+  sigma ~ dunif(0, 10)
+  s.reint ~ dunif(0, 10)
+  s.rebR ~ dunif(0,10)
+  s.reln ~ dunif(0,10)
+  s.lake ~ dunif(0,10)
+  
+  for(i in 1:n) {
+    x.ln[i] <- min(x.tp[i],x.tn[i]/(beta_bR[s.j[i]]))
+    y[i] ~ dnorm(beta_ln[s.j[i]]*log(x.ln[i]) + beta_int[s.j[i]] + relake[s.k[i]], sd = sigma) 
+  }
+  for(j in 1:m) {
+    beta_bR[j] <- b.cr + rebR[j]
+    beta_int[j] <- b.0 + reint[j]
+    beta_ln[j] <- b.tp + reln[j]
+    reint[j] ~ dnorm(0, sd = s.reint)
+    rebR[j] ~ dnorm(0, sd = s.rebR)
+    reln[j] ~ dnorm(0, sd = s.reln)
+  }
+  for (k in 1:p) {
+    relake[k] ~ dnorm(0, sd = s.lake)
+  }
+})
+
+# Dimension Assignment
+n=length(bnla_final$chl); n
+m=length(unique(bnla_final$temp_bin)); m
+p=length(unique(bnla_final$specific_lake_bin)); p
+
+# Prepare data for Nimble model
+constants <- list(n = n, 
+                  m = m, 
+                  x.tp = bnla_final$tp,
+                  x.tn = bnla_final$tn,
+                  s.j = bnla_final$temp_bin,
+                  s.k = bnla_final$specific_lake_bin)
+yt = log(bnla_final$chl) # Observed ln(chl) values
+data <- list(y = yt)
+inits <- list(b.0 = 1, b.tp = 1, b.cr = 15, sigma = 1, s.reint = 1, s.rebR = 1, s.reln = 1, s.lake = 1, relake=rep(0,p), reint=rep(0,m), rebR=rep(0,m), reln=rep(0,m))
+
+# Build/Run Model and Obtain Samples
+Nmodel <- nimbleModel(code, constants = constants, data = data, inits = inits) 
+NmodelMCMC <- buildMCMC(Nmodel, monitors2 = c("beta_bR", "beta_int", "beta_ln", "relake"), enableWAIC = TRUE) 
+cNmodel <- compileNimble(Nmodel)
+cNmodelMCMC <- compileNimble(NmodelMCMC, project=Nmodel)
+n.iter = 50000 # Desired number of iterations
+samples <- runMCMC(cNmodelMCMC, niter = n.iter, WAIC = TRUE, nchains = 3, samplesAsCodaMCMC = TRUE, nburnin = 10000) 
+
+# Save model
+samples_temp <- samples
+```
+
+Here is the performance of the model:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+# Model
+samples <- samples_temp
+
+# Summary of Output
+summary(samples$samples) 
+summary(samples$samples2[,1:15]) 
+
+
+# Rhat Calculations
+gelman.diag(samples$samples) 
+gelman.diag(samples$samples2[,1:15]) 
+
+# Make sample statistics a df mean values can be called directly
+samp1 <- data.frame(summary(samples$samples)$statistics)
+samp2 <- data.frame(summary(samples$samples2[,1:15])$statistics)
+
+# Store lists of parameter coefficients
+beta_bR_means <- samp2$Mean[1:5]
+beta_int_means <- samp2$Mean[6:10]
+beta_tp_means <- samp2$Mean[11:15]
+
+
+# Calculate Predictions
+x.ln = pmin(constants$x.tp,  constants$x.tn/(beta_bR_means[constants$s.j])) #limiting nutrient (units of tp)
+sum(x.ln==constants$x.tp)/length(x.ln) #fraction of time p is limiting
+y.hat = beta_int_means[constants$s.j] + log(x.ln)*(beta_tp_means[constants$s.j]) 
+
+# Calculate R2
+y.er=yt-y.hat
+R2=1-sum(y.er^2)/sum((yt-mean(yt))^2); R2 
+
+# Calculate RMSE
+rmse <- sqrt(mean(y.er^2)); rmse
+```
+
+# Primilinary models based on dual nutrients
+## Binning based on enrichment index
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+# Model Formulation
+code <- nimbleCode({
+  b.0 ~ dnorm(0, sd = 10)
+  b.tp ~ dnorm(0, sd = 10)
+  b.tn ~dnorm(0, sd = 10)
+  sigma ~ dunif(0, 10)
+  s.reint ~ dunif(0, 10)
+  s.retn ~ dunif(0,10)
+  s.retp ~ dunif(0,10)
+  s.lake ~ dunif(0,10)
+  
+  for(i in 1:n) {
+    y[i] ~ dnorm((beta_tp[s.j[i]])*log(x.tp[i]) + (beta_tn[s.j[i]])*log(x.tn[i]) + beta_int[s.j[i]] + relake[s.k[i]], sd = sigma)
+  }
+  for(j in 1:m) {
+    beta_tn[j] <- b.tn + retn[j]
+    beta_int[j] <- b.0 + reint[j]
+    beta_tp[j] <- b.tp + retp[j]
+    reint[j] ~ dnorm(0, sd = s.reint)
+    retn[j] ~ dnorm(0, sd = s.retn)
+    retp[j] ~ dnorm(0, sd = s.retp)
+  }
+  for(k in 1:p) {
+    relake[k] ~ dnorm(0, sd = s.lake)
+  }
+})
+
+# Dimension Assignment
+n=length(bnla_final$chl); n
+m=length(unique(bnla_final$eutro_bin)); m
+p=length(unique(bnla_final$specific_lake_bin)); p
+
+# Prepare data for Nimble model
+constants <- list(n = n, 
+                  m = m,
+                  p = p,
+                  x.tp = bnla_final$tp,
+                  x.tn = bnla_final$tn,
+                  s.j = bnla_final$eutro_bin,
+                  s.k = bnla_final$specific_lake_bin)
+yt = log(bnla_final$chl) # Observed ln(chl) values
+data <- list(y = yt)
+inits <- list(b.0 = 1, b.tp = 1, b.tn = 1, sigma = 1, s.reint = 1, s.retn = 1, s.retp = 1, s.lake = 1, reint=rep(0,m), retn=rep(0,m), retp=rep(0,m), relake=rep(0,p))
+
+# Build/Run Model and Obtain Samples
+Nmodel <- nimbleModel(code, constants = constants, data = data, inits = inits) 
+NmodelMCMC <- buildMCMC(Nmodel, monitors2 = c("beta_tn", "beta_int", "beta_tp", "relake"), enableWAIC = TRUE)
+cNmodel <- compileNimble(Nmodel)
+cNmodelMCMC <- compileNimble(NmodelMCMC, project=Nmodel)
+n.iter = 50000 # Desired number of iterations
+samples <- runMCMC(cNmodelMCMC, niter = n.iter, WAIC = TRUE, nchains = 3, samplesAsCodaMCMC = TRUE, nburnin = 10000) 
+
+# Save model
+samples_dual.nei <- samples
+```
+
+Here is the performance of the model:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+# Model
+samples <- samples_dual.nei
+
+# Summary of Output
+summary(samples$samples) 
+summary(samples$samples2[,1:15]) 
+
+# Rhat Calculations
+gelman.diag(samples$samples) 
+gelman.diag(samples$samples2[,1:15]) 
+
+### Make sample statistics a df mean values can be called directly
+samp1 <- data.frame(summary(samples$samples)$statistics)
+samp2 <- data.frame(summary(samples$samples2[,1:15])$statistics)
+
+# Store lists of parameter coefficients
+beta_tn_means <- samp2$Mean[6:10]
+beta_int_means <- samp2$Mean[1:5]
+beta_tp_means <- samp2$Mean[11:15]
+
+# Calculate Predictions
+y.hat = (beta_tp_means[constants$s.j])*log(constants$x.tp) + (beta_tn_means[constants$s.j])*log(constants$x.tn) + beta_int_means[constants$s.j] 
+
+# Calculate R2 and WAIC
+y.er=yt-y.hat
+R2=1-sum(y.er^2)/sum((yt-mean(yt))^2); R2
+
+# Calculate RMSE
+rmse <- sqrt(mean(y.er^2)); rmse
+```
+
+## Binning based on depth
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+# Model Formulation
+code <- nimbleCode({
+  b.0 ~ dnorm(0, sd = 10)
+  b.tp ~ dnorm(0, sd = 10)
+  b.tn ~dnorm(0, sd = 10)
+  sigma ~ dunif(0, 10)
+  s.reint ~ dunif(0, 10)
+  s.retn ~ dunif(0,10)
+  s.retp ~ dunif(0,10)
+  s.lake ~ dunif(0,10)
+  
+  for(i in 1:n) {
+    y[i] ~ dnorm((beta_tp[s.j[i]])*log(x.tp[i]) + (beta_tn[s.j[i]])*log(x.tn[i]) + beta_int[s.j[i]] + relake[s.k[i]], sd = sigma)
+  }
+  for(j in 1:m) {
+    beta_tn[j] <- b.tn + retn[j]
+    beta_int[j] <- b.0 + reint[j]
+    beta_tp[j] <- b.tp + retp[j]
+    reint[j] ~ dnorm(0, sd = s.reint)
+    retn[j] ~ dnorm(0, sd = s.retn)
+    retp[j] ~ dnorm(0, sd = s.retp)
+  }
+  for(k in 1:p) {
+    relake[k] ~ dnorm(0, sd = s.lake)
+  }
+})
+
+# Dimension Assignment
+n=length(bnla_final$chl); n
+m=length(unique(bnla_final$depth_bin)); m
+p=length(unique(bnla_final$specific_lake_bin)); p
+
+# Prepare data for Nimble model
+constants <- list(n = n, 
+                  m = m,
+                  p = p,
+                  x.tp = bnla_final$tp,
+                  x.tn = bnla_final$tn,
+                  s.j = bnla_final$depth_bin,
+                  s.k = bnla_final$specific_lake_bin)
+yt = log(bnla_final$chl) # Observed ln(chl) values
+data <- list(y = yt)
+inits <- list(b.0 = 1, b.tp = 1, b.tn = 1, sigma = 1, s.reint = 1, s.retn = 1, s.retp = 1, s.lake = 1, reint=rep(0,m), retn=rep(0,m), retp=rep(0,m), relake=rep(0,p))
+
+# Build/Run Model and Obtain Samples
+Nmodel <- nimbleModel(code, constants = constants, data = data, inits = inits) 
+NmodelMCMC <- buildMCMC(Nmodel, monitors2 = c("beta_tn", "beta_int", "beta_tp", "relake"), enableWAIC = TRUE)
+cNmodel <- compileNimble(Nmodel)
+cNmodelMCMC <- compileNimble(NmodelMCMC, project=Nmodel)
+n.iter = 50000 # Desired number of iterations
+samples <- runMCMC(cNmodelMCMC, niter = n.iter, WAIC = TRUE, nchains = 3, samplesAsCodaMCMC = TRUE, nburnin = 10000) 
+
+# Save model
+samples_dual.depth <- samples
+```
+
+Here is the performance of the model:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+# Model
+samples <- samples_dual.depth
+
+# Summary of Output
+summary(samples$samples) 
+summary(samples$samples2[,1:15]) 
+
+# Rhat Calculations
+gelman.diag(samples$samples) 
+gelman.diag(samples$samples2[,1:15]) 
+
+# Make sample statistics a df mean values can be called directly
+samp1 <- data.frame(summary(samples$samples)$statistics)
+samp2 <- data.frame(summary(samples$samples2[,1:15])$statistics)
+
+# Store lists of parameter coefficients
+beta_tn_means <- samp2$Mean[6:10]
+beta_int_means <- samp2$Mean[1:5]
+beta_tp_means <- samp2$Mean[11:15]
+
+
+# Calculate Predictions
+y.hat = (beta_tp_means[constants$s.j])*log(constants$x.tp) + (beta_tn_means[constants$s.j])*log(constants$x.tn) + beta_int_means[constants$s.j] 
+
+# Calculate R2
+y.er=yt-y.hat
+R2=1-sum(y.er^2)/sum((yt-mean(yt))^2); R2 
+
+# Calculate RMSE
+rmse <- sqrt(mean(y.er^2)); rmse
+```
+
+## Binning based on temperature
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+# Model Formulation
+code <- nimbleCode({
+  b.0 ~ dnorm(0, sd = 10)
+  b.tp ~ dnorm(0, sd = 10)
+  b.tn ~dnorm(0, sd = 10)
+  sigma ~ dunif(0, 10)
+  s.reint ~ dunif(0, 10)
+  s.retn ~ dunif(0,10)
+  s.retp ~ dunif(0,10)
+  s.lake ~ dunif(0,10)
+  
+  for(i in 1:n) {
+    y[i] ~ dnorm((beta_tp[s.j[i]])*log(x.tp[i]) + (beta_tn[s.j[i]])*log(x.tn[i]) + beta_int[s.j[i]] + relake[s.k[i]], sd = sigma)
+  }
+  for(j in 1:m) {
+    beta_tn[j] <- b.tn + retn[j]
+    beta_int[j] <- b.0 + reint[j]
+    beta_tp[j] <- b.tp + retp[j]
+    reint[j] ~ dnorm(0, sd = s.reint)
+    retn[j] ~ dnorm(0, sd = s.retn)
+    retp[j] ~ dnorm(0, sd = s.retp)
+  }
+  for(k in 1:p) {
+    relake[k] ~ dnorm(0, sd = s.lake)
+  }
+})
+
+# Dimension Assignment
+n=length(bnla_final$chl); n
+m=length(unique(bnla_final$temp_bin)); m
+p=length(unique(bnla_final$specific_lake_bin)); p
+
+# Prepare data for Nimble model
+constants <- list(n = n, 
+                  m = m,
+                  p = p,
+                  x.tp = bnla_final$tp,
+                  x.tn = bnla_final$tn,
+                  s.j = bnla_final$temp_bin,
+                  s.k = bnla_final$specific_lake_bin)
+yt = log(bnla_final$chl) # Observed ln(chl) values
+data <- list(y = yt)
+inits <- list(b.0 = 1, b.tp = 1, b.tn = 1, sigma = 1, s.reint = 1, s.retn = 1, s.retp = 1, s.lake = 1, reint=rep(0,m), retn=rep(0,m), retp=rep(0,m), relake=rep(0,p))
+
+# Build/Run Model and Obtain Samples
+Nmodel <- nimbleModel(code, constants = constants, data = data, inits = inits) 
+NmodelMCMC <- buildMCMC(Nmodel, monitors2 = c("beta_tn", "beta_int", "beta_tp", "relake"), enableWAIC = TRUE) # REMEMBER TO SET MONITORS
+cNmodel <- compileNimble(Nmodel)
+cNmodelMCMC <- compileNimble(NmodelMCMC, project=Nmodel)
+n.iter = 50000 # Desired number of iterations
+samples <- runMCMC(cNmodelMCMC, niter = n.iter, WAIC = TRUE, nchains = 3, samplesAsCodaMCMC = TRUE, nburnin = 10000) 
+
+# Save model
+samples_dual.temp <- samples
+```
+
+Here is the performance of the model:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+# Model
+samples <- samples_dual.temp
+
+# Summary of Output
+summary(samples$samples) 
+summary(samples$samples2[,1:15]) 
+
+# Rhat Calculations
+gelman.diag(samples$samples) 
+gelman.diag(samples$samples2[,1:15]) 
+
+# Make sample statistics a df mean values can be called directly
+samp1 <- data.frame(summary(samples$samples)$statistics)
+samp2 <- data.frame(summary(samples$samples2[,1:15])$statistics)
+
+# Store lists of parameter coefficients
+beta_tn_means <- samp2$Mean[6:10]
+beta_int_means <- samp2$Mean[1:5]
+beta_tp_means <- samp2$Mean[11:15]
+
+# Calculate Predictions
+y.hat = (beta_tp_means[constants$s.j])*log(constants$x.tp) + (beta_tn_means[constants$s.j])*log(constants$x.tn) + beta_int_means[constants$s.j] 
+
+# Calculate R2
+y.er=yt-y.hat
+R2=1-sum(y.er^2)/sum((yt-mean(yt))^2); R2 
+
+# Calculate RMSE
+rmse <- sqrt(mean(y.er^2)); rmse
+```
+
+
+# Preliminary model with no bins
+## Based on limiting nutrient
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+# Model Formulation
+code <- nimbleCode({
+  b.0 ~ dnorm(0, sd = 10)
+  b.tp ~ dnorm(0, sd = 10)
+  b.cr ~dnorm(20, sd = 5)
+  sigma ~ dunif(0, 10)
+  
+  for(i in 1:n) {
+    x.ln[i] <- min(x.tp[i],x.tn[i]/(b.cr))
+    y[i] ~ dnorm(b.0 + b.tp*log(x.ln[i]), sd = sigma) 
+  }
+
+})
+
+# Dimension Assignment
+n=length(bnla_final$chl); n
+
+# Prepare data for Nimble model
+constants <- list(n = n, 
+                  x.tp = bnla_final$tp,
+                  x.tn = bnla_final$tn)
+yt = log(bnla_final$chl) # Observed ln(chl) values
+data <- list(y = yt)
+inits <- list(b.0 = 1, b.tp = 1, b.cr = 15, sigma = 1)
+
+# Build/Run Model and Obtain Samples
+Nmodel <- nimbleModel(code, constants = constants, data = data, inits = inits) 
+NmodelMCMC <- buildMCMC(Nmodel, enableWAIC = TRUE)
+cNmodel <- compileNimble(Nmodel)
+cNmodelMCMC <- compileNimble(NmodelMCMC, project=Nmodel)
+n.iter = 50000 # Desired number of iterations
+samples <- runMCMC(cNmodelMCMC, niter = n.iter, WAIC = TRUE, nchains = 3, samplesAsCodaMCMC = TRUE, nburnin = 10000) 
+
+# Save model
+samples_LimNut.noBins <- samples
+```
+
+Here is the performance of the model:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+# Model
+samples <- samples_LimNut.noBins
+
+# Summary of Output
+summary(samples$samples) 
+
+# Rhat Calculations
+gelman.diag(samples$samples) 
+
+# Make sample statistics a df mean values can be called directly
+samp1 <- data.frame(summary(samples$samples)$statistics)
+
+# Store lists of parameter coefficients          
+bR_means <- samp1$Mean[2]
+int_means <- samp1$Mean[1]
+tp_means <- samp1$Mean[3]
+
+# Calculate Predictions
+x.ln = pmin(constants$x.tp,  constants$x.tn/(bR_means)) #limiting nutrient (units of tp)
+sum(x.ln==constants$x.tp)/length(x.ln) #fraction of time p is limiting
+y.hat = int_means + log(x.ln)*(tp_means)
+
+# Calculate R2
+y.er=yt-y.hat
+R2=1-sum(y.er^2)/sum((yt-mean(yt))^2); R2 
+
+# Calculate RMSE
+rmse <- sqrt(mean(y.er^2)); rmse
+```
+
+
+
+## Based on dual nutrient
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+# Model Formulation
+code <- nimbleCode({
+  b.0 ~ dnorm(0, sd = 10)
+  b.tp ~ dnorm(0, sd = 10)
+  b.tn ~dnorm(0, sd = 10)
+  sigma ~ dunif(0, 10)
+
+  
+  for(i in 1:n) {
+    y[i] ~ dnorm((b.tp)*log(x.tp[i]) + (b.tn)*log(x.tn[i]) + b.0, sd = sigma)
+  }
+})
+
+# Dimension Assignment
+n=length(bnla_final$chl); n
+
+# Prepare data for Nimble model
+constants <- list(n = n, 
+                  x.tp = bnla_final$tp,
+                  x.tn = bnla_final$tn)
+yt = log(bnla_final$chl) # Observed ln(chl) values
+data <- list(y = yt)
+inits <- list(b.0 = 1, b.tp = 1, b.tn = 1, sigma = 1)
+
+# Build/Run Model and Obtain Samples
+Nmodel <- nimbleModel(code, constants = constants, data = data, inits = inits) 
+NmodelMCMC <- buildMCMC(Nmodel, enableWAIC = TRUE) 
+cNmodel <- compileNimble(Nmodel)
+cNmodelMCMC <- compileNimble(NmodelMCMC, project=Nmodel)
+n.iter = 50000 # Desired number of iterations
+samples <- runMCMC(cNmodelMCMC, niter = n.iter, WAIC = TRUE, nchains = 3, samplesAsCodaMCMC = TRUE, nburnin = 10000) 
+
+# Save model
+samples_DualNut.noBins <- samples
+```
+
+Here is the performance of the model:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+# Model
+samples <- samples_DualNut.noBins
+
+# Summary of Output
+summary(samples$samples) 
+
+# Rhat Calculations
+gelman.diag(samples$samples) 
+
+# Make sample statistics a df mean values can be called directly
+samp1 <- data.frame(summary(samples$samples)$statistics)
+
+# Store lists of parameter coefficients
+tn_means <- samp1$Mean[2]
+int_means <- samp1$Mean[1]
+tp_means <- samp1$Mean[3]
+
+# Calculate Predictions
+y.hat = (tp_means)*log(constants$x.tp) + (tn_means)*log(constants$x.tn) + int_means
+
+# Calculate R2
+y.er=yt-y.hat
+R2=1-sum(y.er^2)/sum((yt-mean(yt))^2); R2 
+
+# Calculate RMSE
+rmse <- sqrt(mean(y.er^2)); rmse
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
