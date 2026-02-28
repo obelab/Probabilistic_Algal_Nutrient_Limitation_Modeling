@@ -89,6 +89,7 @@ NmodelMCMC <- buildMCMC(Nmodel, monitors2 = c("relake"), enableWAIC = TRUE)
 cNmodel <- compileNimble(Nmodel)
 cNmodelMCMC <- compileNimble(NmodelMCMC, project=Nmodel)
 n.iter = 60000 # Desired number of iterations
+set.seed(20260227)
 samples <- runMCMC(cNmodelMCMC, niter = n.iter, WAIC = TRUE, nchains = 3, samplesAsCodaMCMC = TRUE, nburnin = 20000) 
 
 # Save model
@@ -128,6 +129,7 @@ rmse <- sqrt(mean(y.er^2)); rmse
 
 Saving the bR samples
 ```{r Interpret bR samples}
+set.seed(20260227)
 betas <- data.frame(samples$samples$chain3) %>% 
   sample_n(3000) %>%
   select(c(b1.R.depth, b0.R))
@@ -170,6 +172,7 @@ NmodelMCMC <- buildMCMC(Nmodel, monitors2 = c("relake"), enableWAIC = TRUE)
 cNmodel <- compileNimble(Nmodel)
 cNmodelMCMC <- compileNimble(NmodelMCMC, project=Nmodel)
 n.iter = 60000 # Determine the number of iterations
+set.seed(20260227)
 samples <- runMCMC(cNmodelMCMC, niter = n.iter, WAIC = TRUE, nchains = 3, samplesAsCodaMCMC = TRUE, nburnin = 20000) 
 
 # Save model
@@ -209,6 +212,7 @@ samples <- samples_Lake.sd
 # Data from three chains
 obs_samples1 <- data.frame(samples$samples$chain3)
 obs_samples2 <- data.frame(samples$samples2$chain3)
+set.seed(20260227)
 obs_samples <- bind_cols(obs_samples1, obs_samples2) %>% sample_n(3000)
 colnames(obs_samples) <-  c("mu", "s.lake", "sigma", 1:2755)
 
