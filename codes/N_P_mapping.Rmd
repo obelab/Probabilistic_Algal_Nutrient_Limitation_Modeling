@@ -108,7 +108,7 @@ summary(samples$samples)
 gelman.diag(samples$samples) 
 
 # Make sample statistics a df mean values can be called directly
-samp1 <- data.frame(summary(samples$samples)$statistics); samp1
+samp1 <- data.frame(summary(samples$samples)$statistics)
 
 
 # Calculate Predictions
