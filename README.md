@@ -6,8 +6,8 @@
 
 <p align="center">
   <sup>1</sup>Department of Civil, Construction, and Environmental Engineering, North Carolina State University, Raleigh, NC, 27606, USA<br>
-  <sup>2</sup>2Division of Biological Sciences and Flathead Lake Biological Station, University of Montana, Polson, Montana 59860, USA <br>
-  <sup>3</sup>3Center for Geospatial Analytics, North Carolina State University, Raleigh, North Carolina 27695, USA <br>
+  <sup>2</sup>Division of Biological Sciences and Flathead Lake Biological Station, University of Montana, Polson, Montana 59860, USA <br>
+  <sup>3</sup>Center for Geospatial Analytics, North Carolina State University, Raleigh, North Carolina 27695, USA <br>
   <sup>§</sup>Kimley-Horn and Associates, Inc., Dallas, Texas, 75240, USA
 </p>
 
